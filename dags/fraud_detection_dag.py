@@ -349,6 +349,14 @@ def store_transaction(**context):
         df['trans_date_trans_time'] = pd.to_datetime(df['trans_date_trans_time'], unit='ms')
         logger.info("Conversion du timestamp réussie")
 
+        # Récupération de l'indicateur de fraude depuis XCom
+        is_fraud = context['task_instance'].xcom_pull(key='is_fraud', default=False)
+        logger.info(f"Indicateur de fraude récupéré: {is_fraud}")
+
+        # Mise à jour de la colonne is_fraud dans le DataFrame
+        df['is_fraud'] = is_fraud
+        logger.info(f"Colonne is_fraud mise à jour avec la valeur: {is_fraud}")
+
         # Convertir is_fraud en boolean
         df['is_fraud'] = df['is_fraud'].astype(bool)
         logger.info("Conversion de is_fraud en boolean réussie")
@@ -356,10 +364,6 @@ def store_transaction(**context):
         # Log des colonnes et types
         logger.info(f"Colonnes finales avant stockage: {df.columns.tolist()}")
         logger.info(f"Types des données: \n{df.dtypes}")
-
-        # Récupération de l'indicateur de fraude
-        is_fraud = context['task_instance'].xcom_pull(key='is_fraud', default=False)
-        logger.info(f"Indicateur de fraude récupéré: {is_fraud}")
 
         # Détermination de la table cible
         table = 'fraud_transactions' if is_fraud else 'normal_transactions'
