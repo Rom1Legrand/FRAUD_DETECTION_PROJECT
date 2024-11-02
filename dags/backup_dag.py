@@ -1,123 +1,117 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
-import pandas as pd
+import subprocess
 import os
+import pandas as pd
 from utils.common import *
 
-def perform_backup(**context):
+def perform_neon_backup(**context):
+    """Sauvegarde des tables depuis Neon DB"""
     try:
+        logger.info("Démarrage du backup Neon...")
+        
+        # Connexion à la base pour vérifier les données
         engine = get_db_engine()
         
-        # Requête optimisée utilisant les index
-        query_template = """
-        SELECT 
-            transaction_id,
-            cc_num,
-            merchant,
-            category,
-            amt,
-            first,
-            last,
-            gender,
-            street,
-            city,
-            state,
-            zip,
-            lat,
-            long,
-            city_pop,
-            job,
-            dob,
-            trans_num,
-            merch_lat,
-            merch_long,
-            is_fraud,
-            trans_date_trans_time
-        FROM {table}
-        WHERE trans_date_trans_time >= NOW() - INTERVAL '30 days'
-        ORDER BY trans_date_trans_time DESC  -- Utilise l'index pour le tri
-        """
+        # Création du dossier de travail
+        work_dir = '/opt/airflow/backups'
+        os.makedirs(work_dir, exist_ok=True)
         
-        # Récupération avec monitoring du temps
-        start_time = datetime.now()
+        # Récupération de l'URL de la base
+        db_url = os.environ.get('NEON_DATABASE_URL')
+        if not db_url:
+            raise ValueError("NEON_DATABASE_URL n'est pas définie")
         
-        # Récupération des données avec statistiques d'exécution
+        # Vérification des données avant backup
+        tables_data = {}
         with engine.connect() as conn:
-            # Analyse des requêtes
-            conn.execute("ANALYZE fraud_transactions")
-            conn.execute("ANALYZE normal_transactions")
-            
-            logger.info("Récupération des transactions frauduleuses...")
-            fraud_df = pd.read_sql(query_template.format(table='fraud_transactions'), conn)
-            
-            logger.info("Récupération des transactions normales...")
-            normal_df = pd.read_sql(query_template.format(table='normal_transactions'), conn)
+            for table in ['fraud_transactions', 'normal_transactions']:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").scalar()
+                logger.info(f"Nombre de lignes dans {table}: {count}")
+                tables_data[table] = count
         
-        query_time = (datetime.now() - start_time).total_seconds()
+        current_date = datetime.now().strftime('%Y%m')
+        backup_files = []
         
-        # Combinaison des données
-        combined_df = pd.concat([fraud_df, normal_df], ignore_index=True)
+        # Sauvegarde au format CSV (plus fiable pour les données)
+        for table in tables_data.keys():
+            if tables_data[table] > 0:
+                logger.info(f"Sauvegarde de {table} ({tables_data[table]} lignes)...")
+                
+                # Lecture des données
+                df = pd.read_sql(f"SELECT * FROM {table}", engine)
+                
+                # Sauvegarde en CSV
+                csv_file = os.path.join(work_dir, f"{table}_{current_date}.csv")
+                df.to_csv(csv_file, index=False)
+                
+                # Vérification du fichier
+                if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
+                    backup_files.append(csv_file)
+                    logger.info(f"Fichier créé: {csv_file} ({os.path.getsize(csv_file)/1024/1024:.2f} MB)")
+                else:
+                    logger.warning(f"Le fichier {csv_file} est vide ou n'existe pas")
+            else:
+                logger.info(f"Table {table} est vide, pas de backup nécessaire")
         
-        if combined_df.empty:
-            logger.warning("Pas de données à sauvegarder pour les 30 derniers jours")
+        if not backup_files:
+            logger.warning("Aucun fichier de backup créé - toutes les tables sont vides")
             return
-            
-        # Stats pour le rapport
-        stats = {
-            'total_transactions': len(combined_df),
-            'fraud_transactions': len(fraud_df),
-            'normal_transactions': len(normal_df),
-            'total_amount': combined_df['amt'].sum(),
-            'period_start': combined_df['trans_date_trans_time'].min(),
-            'period_end': combined_df['trans_date_trans_time'].max(),
-            'query_time': query_time
-        }
-        
-        # Sauvegarde temporaire
-        tmp_file = '/tmp/monthly_backup.csv'
-        combined_df.to_csv(tmp_file, index=False)
         
         # Upload vers S3
-        current_date = datetime.now()
-        s3_key = f"{S3_PREFIX}/backups/monthly_{current_date.strftime('%Y%m')}.csv"
-        
-        start_upload = datetime.now()
         s3_client = get_s3_client()
-        s3_client.upload_file(tmp_file, S3_BUCKET, s3_key)
-        upload_time = (datetime.now() - start_upload).total_seconds()
+        uploaded_files = []
         
-        # Nettoyage
-        os.remove(tmp_file)
+        for backup_file in backup_files:
+            try:
+                file_name = os.path.basename(backup_file)
+                s3_key = f"{S3_PREFIX}/backups/{current_date}/{file_name}"
+                
+                logger.info(f"Upload vers S3: {s3_key}")
+                s3_client.upload_file(backup_file, S3_BUCKET, s3_key)
+                uploaded_files.append(s3_key)
+                
+                # Vérification de l'upload
+                s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+                logger.info(f"Upload vérifié pour {s3_key}")
+                
+            except Exception as e:
+                logger.error(f"Erreur lors de l'upload de {backup_file}: {str(e)}")
+                raise
+            finally:
+                if os.path.exists(backup_file):
+                    os.remove(backup_file)
+                    logger.info(f"Fichier local supprimé: {backup_file}")
         
-        # Notification avec performances
+        # Notification email
+        files_info = "\n".join([
+            f"- {table}: {count:,} lignes"
+            for table, count in tables_data.items()
+            if count > 0
+        ])
+        
         email_body = f"""
-        Backup mensuel effectué avec succès!
-
-        Statistiques du backup :
-        - Période : du {stats['period_start']} au {stats['period_end']}
-        - Total transactions : {stats['total_transactions']:,}
-        - Transactions normales : {stats['normal_transactions']:,}
-        - Transactions frauduleuses : {stats['fraud_transactions']:,}
-        - Montant total : {stats['total_amount']:,.2f}€
-
-        Performances :
-        - Temps d'extraction : {stats['query_time']:.2f} secondes
-        - Temps d'upload S3 : {upload_time:.2f} secondes
-        - Taille du fichier : {os.path.getsize(tmp_file) / (1024*1024):.2f} MB
-
-        Fichier sauvegardé : s3://{S3_BUCKET}/{s3_key}
+        Backup Neon DB effectué avec succès!
+        
+        Résumé des données sauvegardées:
+        {files_info}
+        
+        Fichiers créés:
+        {chr(10).join([f"- s3://{S3_BUCKET}/{f}" for f in uploaded_files])}
+        
+        Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
         
         send_email(
-            subject=f"Backup mensuel des transactions - {current_date.strftime('%B %Y')}",
+            subject=f"✅ Backup Neon DB - {current_date}",
             body=email_body
         )
         
-        logger.info(f"Backup terminé : {stats['total_transactions']} transactions sauvegardées")
+        logger.info("Backup Neon terminé avec succès")
         
     except Exception as e:
-        logger.error(f"Erreur de backup: {str(e)}")
+        logger.error(f"Erreur lors du backup Neon: {str(e)}")
         raise
 
 default_args = {
@@ -130,16 +124,16 @@ default_args = {
 }
 
 with DAG(
-    'fraud_backup',
+    'neon_backup_v2',  # Nouveau nom pour éviter les conflits
     default_args=default_args,
-    description='Backup mensuel des données de transactions',
-    schedule_interval='0 0 1 * *',  # Tous les 1er du mois à minuit
+    description='Backup des tables Neon DB en CSV',
+    schedule_interval='0 0 1 * *',
     start_date=datetime(2024, 1, 1),
     catchup=False
 ) as dag:
 
     backup = PythonOperator(
-        task_id='perform_backup',
-        python_callable=perform_backup,
+        task_id='perform_neon_backup',
+        python_callable=perform_neon_backup,
         provide_context=True
     )
